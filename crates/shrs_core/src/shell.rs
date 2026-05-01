@@ -274,8 +274,12 @@ impl ShellConfig {
     ///
     /// Use for non-interactive evaluation (e.g., `shell -c "cmd"`).
     /// The returned Shell can be used with `shell.lang.eval()`.
-    pub fn build(mut self) -> anyhow::Result<(Shell, States)> {
-        let (mut sh, mut states, _) = self.build_parts()?;;
+    /// Build the Shell and States without starting the interactive loop.
+    ///
+    /// Use for non-interactive evaluation (e.g., `shell -c "cmd"`).
+    /// The returned Shell can be used with `shell.lang.eval()`.
+    pub fn build_shell(mut self) -> anyhow::Result<(Shell, States)> {
+        let (mut sh, mut states, _) = self.build_parts()?;;;
         // Fire startup hooks (same as interactive mode)
         let startup_ctx = StartupCtx {
             startup_time: states.get::<StartupTime>().elapsed(),
