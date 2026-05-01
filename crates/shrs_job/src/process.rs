@@ -248,15 +248,15 @@ where
 
                 // Set the terminal control device in both parent process (see job
                 // manager) and child process to avoid race conditions
-                // tcsetpgrp(3) failing represents programmer error, e.g.
-                // 1) invalid fd or pgid
-                // 2) not a tty
-                //   - Are you configuring stdin using Command::stdin? If so, then
-                //     stdin will not be a TTY if this process isn't first in the
-                //     pipeline, as Command::stdin configures stdin *before*
-                //     before_exec runs.
-                // 3) incorrect permissions
-                unistd::tcsetpgrp(shell_terminal, pgid).expect("tcsetpgrp failed");
+                // tcsetpgrp(3) may fail with ENOTTY in non-interactive mode (no tty).
+                // Only panic on unexpected errors.
+                if let Err(e) = unistd::tcsetpgrp(shell_terminal, pgid) {
+                    let errno = nix::errno::Errno::last();
+                    if errno != nix::errno::Errno::ENOTTY {
+                        panic!("tcsetpgrp failed: {e}");
+                    }
+                    // Non-interactive: no controlling terminal, that's fine
+                }
 
                 // Reset job control signal handling back to default
                 // signal(3) failing represents programmer error, e.g.
@@ -310,7 +310,7 @@ where
                 warn!("failed to spawn child, resetting terminal's pgrp");
                 // see above comment for tcsetpgrp(2) failing being programmer
                 // error
-                unistd::tcsetpgrp(util::get_terminal(), unistd::getpgrp()).unwrap();
+                let _ = unistd::tcsetpgrp(util::get_terminal(), unistd::getpgrp());
             }
             return Err(e.into());
         },

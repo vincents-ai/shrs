@@ -402,7 +402,10 @@ impl TerminalState {
     fn new(new_pgid: Pid) -> TerminalState {
         debug!("setting terminal process group to job's process group");
         let shell_terminal = util::get_terminal();
-        unistd::tcsetpgrp(shell_terminal, new_pgid).unwrap();
+        // Non-interactive: tcsetpgrp may fail with ENOTTY, that's ok
+        if let Err(e) = unistd::tcsetpgrp(shell_terminal, new_pgid) {
+            debug!("tcsetpgrp failed (non-interactive?): {e}");
+        }
         TerminalState {
             prev_pgid: unistd::getpgrp(),
             prev_tmodes: termios::tcgetattr(shell_terminal).ok(),
@@ -414,7 +417,7 @@ impl Drop for TerminalState {
     fn drop(&mut self) {
         debug!("putting shell back into foreground and restoring shell's terminal modes");
         let shell_terminal = util::get_terminal();
-        unistd::tcsetpgrp(shell_terminal, self.prev_pgid).unwrap();
+        let _ = unistd::tcsetpgrp(shell_terminal, self.prev_pgid);
         if let Some(ref prev_tmodes) = self.prev_tmodes {
             let temp_result =
                 termios::tcsetattr(shell_terminal, termios::SetArg::TCSADRAIN, prev_tmodes);
