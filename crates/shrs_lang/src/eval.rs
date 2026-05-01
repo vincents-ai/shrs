@@ -154,7 +154,108 @@ fn eval_command(
                 Ok((vec![], None))
             }
         },
+        ast::Command::SeqList(a_cmd, b_cmd) => {
+            let (procs, pgid) = eval_command(job_manager, a_cmd, stdin, stdout)?;
+            run_job(job_manager, procs, pgid, true)?;
+
+            if let Some(b_cmd) = b_cmd {
+                eval_command(job_manager, b_cmd, None, None)
+            } else {
+                Ok((vec![], None))
+            }
+        },
+        ast::Command::And(a_cmd, b_cmd) => {
+            let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
+            let exit_code = run_job(job_manager, procs, pgid, true);
+            if exit_code.is_ok() {
+                eval_command(job_manager, b_cmd, None, None)
+            } else {
+                Ok((vec![], None))
+            }
+        },
+        ast::Command::Or(a_cmd, b_cmd) => {
+            let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
+            let exit_code = run_job(job_manager, procs, pgid, true);
+            if exit_code.is_err() {
+                eval_command(job_manager, b_cmd, None, None)
+            } else {
+                Ok((vec![], None))
+            }
+        },
+        ast::Command::Not(cmd) => {
+            let (procs, pgid) = eval_command(job_manager, cmd, None, None)?;
+            run_job(job_manager, procs, pgid, true)?;
+            Ok((vec![], None))
+        },
+        ast::Command::Subshell(cmd) => {
+            eval_command(job_manager, cmd, stdin, stdout)
+        },
+        ast::Command::If {
+            conds,
+            else_part,
+        } => {
+            for cond in conds {
+                let (procs, pgid) = eval_command(job_manager, &cond.cond, None, None)?;
+                let result = run_job(job_manager, procs, pgid, true);
+                if result.is_ok() {
+                    return eval_command(job_manager, &cond.body, None, None);
+                }
+            }
+            if let Some(else_cmd) = else_part {
+                eval_command(job_manager, else_cmd, None, None)
+            } else {
+                Ok((vec![], None))
+            }
+        },
+        ast::Command::While { cond, body } => {
+            loop {
+                let (procs, pgid) = eval_command(job_manager, cond, None, None)?;
+                let result = run_job(job_manager, procs, pgid, true);
+                if result.is_err() {
+                    break;
+                }
+                let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
+                run_job(job_manager, body_procs, body_pgid, true)?;
+            }
+            Ok((vec![], None))
+        },
+        ast::Command::Until { cond, body } => {
+            loop {
+                let (procs, pgid) = eval_command(job_manager, cond, None, None)?;
+                let result = run_job(job_manager, procs, pgid, true);
+                if result.is_ok() {
+                    break;
+                }
+                let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
+                run_job(job_manager, body_procs, body_pgid, true)?;
+            }
+            Ok((vec![], None))
+        },
+        ast::Command::For {
+            name: _,
+            wordlist,
+            body,
+        } => {
+            for word in wordlist {
+                // TODO: set variable `name` to `word` in the environment
+                std::env::set_var("_iter_val", word);
+                let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
+                run_job(job_manager, body_procs, body_pgid, true)?;
+            }
+            Ok((vec![], None))
+        },
+        ast::Command::Case { word: _, arms } => {
+            // TODO: proper pattern matching
+            for arm in arms {
+                let (procs, pgid) = eval_command(job_manager, &arm.body, None, None)?;
+                run_job(job_manager, procs, pgid, true)?;
+            }
+            Ok((vec![], None))
+        },
+        ast::Command::Fn { fname: _, body } => {
+            // TODO: register function
+            eval_command(job_manager, body, None, None)
+        },
         ast::Command::None => Ok((vec![], None)),
-        _ => todo!(),
     }
 }
