@@ -275,7 +275,7 @@ impl ShellConfig {
     /// Use for non-interactive evaluation (e.g., `shell -c "cmd"`).
     /// The returned Shell can be used with `shell.lang.eval()`.
     pub fn build(mut self) -> anyhow::Result<(Shell, States)> {
-        let (mut sh, mut states) = self.build_internal()?;
+        let (mut sh, mut states, _) = self.build_parts()?;;
         // Fire startup hooks (same as interactive mode)
         let startup_ctx = StartupCtx {
             startup_time: states.get::<StartupTime>().elapsed(),
@@ -289,12 +289,12 @@ impl ShellConfig {
     /// This function contains the main loop of the shell and thus will block for the entire
     /// execution of the shell.
     pub fn run(mut self) -> anyhow::Result<()> {
-        let (mut sh, mut states) = self.build_internal()?;
-        run_shell(&mut states, &mut sh, &mut self.readline)
+        let (mut sh, mut states, mut readline) = self.build_parts()?;
+        run_shell(&mut states, &mut sh, &mut readline)
     }
 
-    /// Internal: construct Shell and States from ShellConfig.
-    fn build_internal(mut self) -> anyhow::Result<(Shell, States)> {
+    /// Internal: construct Shell, States, and Readline from ShellConfig.
+    fn build_parts(mut self) -> anyhow::Result<(Shell, States, Box<dyn Readline>)> {
         // run plugins first
         let plugins = self.plugins.drain(..).collect::<Vec<_>>();
         for plugin in plugins.iter() {
@@ -377,7 +377,7 @@ impl ShellConfig {
             }
         }
 
-        Ok((sh, self.states))
+        Ok((sh, self.states, self.readline))
     }
 }
 
