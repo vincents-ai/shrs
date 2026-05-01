@@ -13,7 +13,8 @@ pub struct PosixLang {}
 
 impl Default for PosixLang {
     fn default() -> Self {
-        initialize_job_control().unwrap();
+        // Job control init may fail in non-interactive mode (no tty) — that's fine
+        let _ = initialize_job_control();
         Self {}
     }
 }
