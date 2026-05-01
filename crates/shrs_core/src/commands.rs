@@ -40,7 +40,7 @@ pub struct Commands {
 }
 
 impl Commands {
-    pub(crate) fn new() -> Commands {
+    pub fn new() -> Commands {
         Commands {
             queue: RefCell::new(VecDeque::new()),
         }

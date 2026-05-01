@@ -270,25 +270,38 @@ impl ShellBuilder {
 }
 
 impl ShellConfig {
+    /// Build the Shell and States without starting the interactive loop.
+    ///
+    /// Use for non-interactive evaluation (e.g., `shell -c "cmd"`).
+    /// The returned Shell can be used with `shell.lang.eval()`.
+    pub fn build(mut self) -> anyhow::Result<(Shell, States)> {
+        let (mut sh, mut states) = self.build_internal()?;
+        // Fire startup hooks (same as interactive mode)
+        let startup_ctx = StartupCtx {
+            startup_time: states.get::<StartupTime>().elapsed(),
+        };
+        sh.run_hooks_in_core(&mut states, startup_ctx);
+        Ok((sh, states))
+    }
+
     /// Start up the shell
     ///
     /// This function contains the main loop of the shell and thus will block for the entire
     /// execution of the shell.
     pub fn run(mut self) -> anyhow::Result<()> {
-        // TODO some default values for Context and Runtime are duplicated by the #[builder(default = "...")]
-        // calls in ShellBuilder, so we are sort of defining the full default here. Maybe end
-        // up implementing Default for Context and Runtime
+        let (mut sh, mut states) = self.build_internal()?;
+        run_shell(&mut states, &mut sh, &mut self.readline)
+    }
 
+    /// Internal: construct Shell and States from ShellConfig.
+    fn build_internal(mut self) -> anyhow::Result<(Shell, States)> {
         // run plugins first
-        // TODO ownership issue here since other plugins can technically add plugins during init
-        // process
         let plugins = self.plugins.drain(..).collect::<Vec<_>>();
         for plugin in plugins.iter() {
             let plugin_meta = plugin.meta();
             info!("Initializing plugin '{}'...", plugin_meta.name);
 
             if let Err(e) = plugin.init(&mut self) {
-                // Error handling for plugin
                 match plugin.fail_mode() {
                     FailMode::Warn => warn!(
                         "Plugin '{}' failed to initialize with {}",
@@ -304,13 +317,10 @@ impl ShellConfig {
         let rt = Runtime {
             env: self.env,
             working_dir: std::env::current_dir().unwrap(),
-            // TODO currently hardcoded
             name: "shrs".into(),
-            // TODO currently unused (since we have not implemented functions etc)
             args: vec![],
             exit_status: 0,
             config_dir: self.config_dir,
-            // functions: self.functions,
         };
         self.states.insert(rt);
         self.states.insert(self.alias);
@@ -331,7 +341,7 @@ impl ShellConfig {
         ));
         self.states.insert(JobManager::default());
 
-        //Line states
+        // Line states
         self.states.insert(self.buffer_history);
         self.states.insert(self.menu);
         self.states.insert(self.snippets);
@@ -354,7 +364,6 @@ impl ShellConfig {
                 let plugin_meta = plugin.meta();
                 info!("Post-initializing plugin '{}'...", plugin_meta.name);
 
-                // Error handling for plugin
                 match plugin.fail_mode() {
                     FailMode::Warn => warn!(
                         "Plugin '{}' failed to post-initialize with {}",
@@ -368,7 +377,7 @@ impl ShellConfig {
             }
         }
 
-        run_shell(&mut self.states, &mut sh, &mut self.readline)
+        Ok((sh, self.states))
     }
 }
 

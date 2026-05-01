@@ -57,6 +57,7 @@ pub struct ProcessGroup {
     pub foreground: bool,
 }
 
+#[allow(dead_code)]
 struct BuiltinProcess {
     argv: Vec<String>,
     status_code: ExitStatus,
