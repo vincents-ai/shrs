@@ -144,80 +144,110 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a word that starts with $, consuming $() and $(()) as part of the word.
-    fn take_dollar_word(&mut self, start: usize, end: usize) -> (&'input str, usize) {
-        let bytes = self.input.as_bytes();
-        let len = bytes.len();
-        let mut pos = start;
+    fn take_dollar_word(&mut self, start: usize, mut end: usize) -> (&'input str, usize) {
+        // At this point, we've consumed the '$' character (start..end spans '$')
+        // and self.lookahead points to the next character.
 
-        // Read the $ prefix
-        if pos < len && bytes[pos] == b'$' {
-            pos += 1;
+        if let Some((_, next_ch, _)) = self.lookahead {
+            match next_ch {
+                '(' => {
+                    // Could be $(( or $(
+                    let (_s, _e) = self.advance().unwrap(); // consume first (
+                    end = _e;
 
-            // Check for $((  — arithmetic expansion
-            if pos + 1 < len && bytes[pos] == b'(' && bytes[pos + 1] == b'(' {
-                pos += 2; // skip ((
-                let depth = 1;
-                pos = self.skip_nested(pos, "((", "))", depth);
-                return (&self.input[start..pos], pos);
+                    if let Some((_, '(', _)) = self.lookahead {
+                        // $(( — arithmetic expansion, read until ))
+                        let (_s, _e) = self.advance().unwrap(); // consume second (
+                        end = _e;
+                        let mut depth = 1;
+                        while let Some((_, ch, _)) = self.lookahead {
+                            if ch == ')' {
+                                let (_, _, e1) = self.advance().unwrap();
+                                if let Some((_, ')', e2)) = self.lookahead {
+                                    depth -= 1;
+                                    let (_, _, _) = self.advance().unwrap(); // consume second )
+                                    end = e2;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                } else {
+                                    end = e1;
+                                }
+                            } else if ch == '(' {
+                                depth += 1;
+                                let (_, _, e) = self.advance().unwrap();
+                                end = e;
+                            } else {
+                                let (_, _, e) = self.advance().unwrap();
+                                end = e;
+                            }
+                        }
+                    } else {
+                        // $( — command substitution, read until matching )
+                        let mut depth = 1;
+                        while let Some((_, ch, _)) = self.lookahead {
+                            if ch == '(' {
+                                depth += 1;
+                                let (_, _, e) = self.advance().unwrap();
+                                end = e;
+                            } else if ch == ')' {
+                                depth -= 1;
+                                let (_, _, e) = self.advance().unwrap();
+                                end = e;
+                                if depth == 0 {
+                                    break;
+                                }
+                            } else {
+                                let (_, _, e) = self.advance().unwrap();
+                                end = e;
+                            }
+                        }
+                    }
+                    return (&self.input[start..end], end);
+                },
+                '{' => {
+                    // ${VAR} — braced variable
+                    while let Some((_, ch, _)) = self.lookahead {
+                        let (_, _, e) = self.advance().unwrap();
+                        end = e;
+                        if ch == '}' {
+                            break;
+                        }
+                    }
+                    // Continue reading the rest as a normal word
+                    while let Some((_, ch, _)) = self.lookahead {
+                        if !is_word_continue(ch) {
+                            break;
+                        }
+                        let (_, _, e) = self.advance().unwrap();
+                        end = e;
+                    }
+                    return (&self.input[start..end], end);
+                },
+                _ => {
+                    // Simple $VAR — read alphanumeric, then rest of word
+                    while let Some((_, ch, _)) = self.lookahead {
+                        if ch.is_alphanumeric() || ch == '_' {
+                            let (_, _, e) = self.advance().unwrap();
+                            end = e;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Continue reading the rest as a normal word
+                    while let Some((_, ch, _)) = self.lookahead {
+                        if !is_word_continue(ch) {
+                            break;
+                        }
+                        let (_, _, e) = self.advance().unwrap();
+                        end = e;
+                    }
+                    return (&self.input[start..end], end);
+                },
             }
-
-            // Check for $( — command substitution
-            if pos < len && bytes[pos] == b'(' {
-                pos += 1; // skip (
-                let depth = 1;
-                pos = self.skip_nested(pos, "(", ")", depth);
-                return (&self.input[start..pos], pos);
-            }
-
-            // Check for ${ — braced variable
-            if pos < len && bytes[pos] == b'{' {
-                pos += 1;
-                while pos < len && bytes[pos] != b'}' {
-                    pos += 1;
-                }
-                if pos < len {
-                    pos += 1; // skip }
-                }
-                return (&self.input[start..pos], pos);
-            }
-
-            // Simple $VAR — read alphanumeric chars
-            while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
-                pos += 1;
-            }
-            // Continue reading the rest of the word
-            while pos < len && is_word_continue(bytes[pos] as char) {
-                pos += 1;
-            }
-            return (&self.input[start..pos], pos);
         }
 
         (&self.input[start..end], end)
-    }
-
-    /// Skip nested delimiters, returning position after the final closing delimiter.
-    fn skip_nested(&self, mut pos: usize, open: &str, close: &str, mut depth: usize) -> usize {
-        let bytes = self.input.as_bytes();
-        let len = bytes.len();
-        let open_bytes = open.as_bytes();
-        let close_bytes = close.as_bytes();
-
-        while pos < len && depth > 0 {
-            // Check for closing delimiter
-            if pos + close_bytes.len() <= len && &bytes[pos..pos + close_bytes.len()] == close_bytes {
-                depth -= 1;
-                pos += close_bytes.len();
-                continue;
-            }
-            // Check for opening delimiter
-            if pos + open_bytes.len() <= len && &bytes[pos..pos + open_bytes.len()] == open_bytes {
-                depth += 1;
-                pos += open_bytes.len();
-                continue;
-            }
-            pos += 1;
-        }
-        pos
     }
 
     // TODO escape characters
