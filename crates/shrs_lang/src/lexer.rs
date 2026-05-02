@@ -118,7 +118,12 @@ impl<'input> Lexer<'input> {
         start: usize,
         end: usize,
     ) -> Result<(usize, Token<'input>, usize), Error> {
-        let (word, end) = self.take_until(start, end, |ch| !is_word_continue(ch));
+        // Check if we're starting with $ — may need to consume $() or $(()) as part of word
+        let (word, end) = if start < self.input.len() && self.input.as_bytes()[start] == b'$' {
+            self.take_dollar_word(start, end)
+        } else {
+            self.take_until(start, end, |ch| !is_word_continue(ch))
+        };
         let token = match word {
             "if" => Token::IF,
             "then" => Token::THEN,
@@ -136,6 +141,83 @@ impl<'input> Lexer<'input> {
             word => Token::WORD(word),
         };
         Ok((start, token, end))
+    }
+
+    /// Read a word that starts with $, consuming $() and $(()) as part of the word.
+    fn take_dollar_word(&mut self, start: usize, end: usize) -> (&'input str, usize) {
+        let bytes = self.input.as_bytes();
+        let len = bytes.len();
+        let mut pos = start;
+
+        // Read the $ prefix
+        if pos < len && bytes[pos] == b'$' {
+            pos += 1;
+
+            // Check for $((  — arithmetic expansion
+            if pos + 1 < len && bytes[pos] == b'(' && bytes[pos + 1] == b'(' {
+                pos += 2; // skip ((
+                let depth = 1;
+                pos = self.skip_nested(pos, "((", "))", depth);
+                return (&self.input[start..pos], pos);
+            }
+
+            // Check for $( — command substitution
+            if pos < len && bytes[pos] == b'(' {
+                pos += 1; // skip (
+                let depth = 1;
+                pos = self.skip_nested(pos, "(", ")", depth);
+                return (&self.input[start..pos], pos);
+            }
+
+            // Check for ${ — braced variable
+            if pos < len && bytes[pos] == b'{' {
+                pos += 1;
+                while pos < len && bytes[pos] != b'}' {
+                    pos += 1;
+                }
+                if pos < len {
+                    pos += 1; // skip }
+                }
+                return (&self.input[start..pos], pos);
+            }
+
+            // Simple $VAR — read alphanumeric chars
+            while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+                pos += 1;
+            }
+            // Continue reading the rest of the word
+            while pos < len && is_word_continue(bytes[pos] as char) {
+                pos += 1;
+            }
+            return (&self.input[start..pos], pos);
+        }
+
+        (&self.input[start..end], end)
+    }
+
+    /// Skip nested delimiters, returning position after the final closing delimiter.
+    fn skip_nested(&self, mut pos: usize, open: &str, close: &str, mut depth: usize) -> usize {
+        let bytes = self.input.as_bytes();
+        let len = bytes.len();
+        let open_bytes = open.as_bytes();
+        let close_bytes = close.as_bytes();
+
+        while pos < len && depth > 0 {
+            // Check for closing delimiter
+            if pos + close_bytes.len() <= len && &bytes[pos..pos + close_bytes.len()] == close_bytes {
+                depth -= 1;
+                pos += close_bytes.len();
+                continue;
+            }
+            // Check for opening delimiter
+            if pos + open_bytes.len() <= len && &bytes[pos..pos + open_bytes.len()] == open_bytes {
+                depth += 1;
+                pos += open_bytes.len();
+                continue;
+            }
+            pos += 1;
+        }
+        pos
     }
 
     // TODO escape characters

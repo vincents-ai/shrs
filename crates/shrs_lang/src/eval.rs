@@ -478,6 +478,15 @@ fn eval_command(
             let default_stdout = stdout.unwrap_or(Output::Inherit);
             let (proc_stdin, proc_stdout) = process_redirects(redirects, default_stdin, default_stdout);
 
+            // Shell builtins — intercept before external command lookup
+            match program.as_str() {
+                "true" => return Ok((vec![], None)),  // exit 0
+                "false" => return Err(PosixError::CommandNotFound("false".into())), // exit 1
+                "break" => return Ok((vec![], None)),
+                ":" => return Ok((vec![], None)), // no-op, exit 0
+                _ => {},
+            }
+
             let (proc, pgid) = match run_external_command(
                 &program,
                 &args,
