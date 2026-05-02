@@ -152,12 +152,12 @@ impl<'input> Lexer<'input> {
             match next_ch {
                 '(' => {
                     // Could be $(( or $(
-                    let (_s, _e) = self.advance().unwrap(); // consume first (
+                    let (_, _, _e) = self.advance().unwrap(); // consume first (
                     end = _e;
 
                     if let Some((_, '(', _)) = self.lookahead {
                         // $(( — arithmetic expansion, read until ))
-                        let (_s, _e) = self.advance().unwrap(); // consume second (
+                        let (_, _, _e) = self.advance().unwrap(); // consume second (
                         end = _e;
                         let mut depth = 1;
                         while let Some((_, ch, _)) = self.lookahead {
