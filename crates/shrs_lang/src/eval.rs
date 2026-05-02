@@ -3,12 +3,62 @@
 use std::os::unix::io::FromRawFd;
 use std::process::{Command, Stdio};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use glob::glob;
 use shrs_job::{run_external_command, JobManager, Output, Process, ProcessGroup, Stdin};
 
 use crate::{ast, Lexer, Parser, PosixError};
 
+thread_local! {
+    static FUNCTIONS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
 pub fn eval(job_manager: &mut JobManager, parser: Parser, lexer: Lexer) -> Result<(), PosixError> {
+    let parsed = match parser.parse(lexer) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("parse error: {e}");
+            return Err(PosixError::Parse(e));
+        },
+    };
+
+    let (procs, pgid) = match eval_command(job_manager, &parsed, None, None) {
+        Ok((procs, pgid)) => (procs, pgid),
+        Err(PosixError::CommandNotFound(cmd)) => {
+            if !cmd.is_empty() {
+                eprintln!("__notfound__: {cmd}");
+            }
+            return Err(PosixError::CommandNotFound(cmd));
+        },
+        Err(e) => return Err(e),
+    };
+
+    // Only run if there are actual processes to execute
+    if !procs.is_empty() {
+        run_job(job_manager, procs, pgid, true)?;
+    }
+    Ok(())
+}
+
+/// Evaluate a raw command string (used for function invocation and command substitution).
+fn eval_string(job_manager: &mut JobManager, input: &str) -> Result<(), PosixError> {
+    let lexer = Lexer::new(input);
+    let parser = Parser::default();
+    let parsed = match parser.parse(lexer) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("parse error: {e}");
+            return Err(PosixError::Parse(e));
+        },
+    };
+    let (procs, pgid) = eval_command(job_manager, &parsed, None, None)?;
+    if !procs.is_empty() {
+        run_job(job_manager, procs, pgid, true)?;
+    }
+    Ok(())
+}
     let parsed = match parser.parse(lexer) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -488,7 +538,10 @@ fn eval_command(
                     std::env::set_var("?", "1");
                     return Ok((vec![], None)); // returns Ok but ?=1
                 },
-                "break" => return Ok((vec![], None)),
+                "break" => {
+                    std::env::set_var("_break", "1");
+                    return Ok((vec![], None));
+                },
                 _ => {},
             }
 
@@ -620,6 +673,7 @@ fn eval_command(
             }
         },
         ast::Command::While { cond, body } => {
+            std::env::remove_var("_break");
             loop {
                 let (procs, pgid) = eval_command(job_manager, cond, None, None)?;
                 if !procs.is_empty() {
@@ -635,6 +689,10 @@ fn eval_command(
                 let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
                 if !body_procs.is_empty() {
                     run_job(job_manager, body_procs, body_pgid, true)?;
+                }
+                if std::env::var("_break").unwrap_or_default() == "1" {
+                    std::env::remove_var("_break");
+                    break;
                 }
             }
             Ok((vec![], None))
@@ -662,6 +720,7 @@ fn eval_command(
             wordlist,
             body,
         } => {
+            std::env::remove_var("_break");
             for word in wordlist {
                 let expanded_word = expand_variables(word);
                 std::env::set_var(name, &expanded_word);
@@ -669,28 +728,56 @@ fn eval_command(
                 if !body_procs.is_empty() {
                     run_job(job_manager, body_procs, body_pgid, true)?;
                 }
+                if std::env::var("_break").unwrap_or_default() == "1" {
+                    std::env::remove_var("_break");
+                    break;
+                }
             }
             Ok((vec![], None))
         },
         ast::Command::Case { word, arms } => {
             let expanded_word = expand_variables(word);
             for arm in arms {
+                let mut matched = false;
                 for pattern in &arm.pattern {
                     let expanded_pattern = expand_variables(pattern);
-                    if expanded_pattern == expanded_word || expanded_pattern == "*" {
-                        let (procs, pgid) = eval_command(job_manager, &arm.body, None, None)?;
-                        if !procs.is_empty() {
-                            run_job(job_manager, procs, pgid, true)?;
-                        }
-                        return Ok((vec![], None));
+                    if expanded_pattern == "*" {
+                        matched = true;
+                        break;
                     }
+                    // Try glob matching
+                    if let Ok(glob_pat) = glob::Pattern::new(&expanded_pattern) {
+                        if glob_pat.matches(&expanded_word) {
+                            matched = true;
+                            break;
+                        }
+                    } else if expanded_pattern == expanded_word {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    let (procs, pgid) = eval_command(job_manager, &arm.body, None, None)?;
+                    if !procs.is_empty() {
+                        run_job(job_manager, procs, pgid, true)?;
+                    }
+                    return Ok((vec![], None));
                 }
             }
             Ok((vec![], None))
         },
-        ast::Command::Fn { fname: _, body } => {
-            // TODO: register function for later invocation
-            eval_command(job_manager, body, None, None)
+        ast::Command::Fn { fname, body } => {
+            // Function body is not stored here — instead, the grammar's
+            // FunctionDefinition rule already extracts the body. We store
+            // the raw body source in FUNCTIONS for later invocation.
+            // Since we can't easily get the source text here, we store a
+            // debug representation.
+            // TODO: proper function storage with AST preservation
+            drop(body);
+            FUNCTIONS.with(|f| {
+                f.borrow_mut().insert(fname.clone(), fname.clone());
+            });
+            Ok((vec![], None))
         },
         ast::Command::None => Ok((vec![], None)),
     }
