@@ -480,10 +480,15 @@ fn eval_command(
 
             // Shell builtins — intercept before external command lookup
             match program.as_str() {
-                "true" => return Ok((vec![], None)),  // exit 0
-                "false" => return Err(PosixError::CommandNotFound("false".into())), // exit 1
+                "true" | ":" => {
+                    std::env::set_var("?", "0");
+                    return Ok((vec![], None));
+                },
+                "false" => {
+                    std::env::set_var("?", "1");
+                    return Ok((vec![], None)); // returns Ok but ?=1
+                },
                 "break" => return Ok((vec![], None)),
-                ":" => return Ok((vec![], None)), // no-op, exit 0
                 _ => {},
             }
 
@@ -532,7 +537,11 @@ fn eval_command(
         ast::Command::SeqList(a_cmd, b_cmd) => {
             let (procs, pgid) = eval_command(job_manager, a_cmd, stdin, stdout)?;
             if !procs.is_empty() {
-                run_job(job_manager, procs, pgid, true)?;
+                let result = run_job(job_manager, procs, pgid, true);
+                match result {
+                    Ok(()) => std::env::set_var("?", "0"),
+                    Err(_) => std::env::set_var("?", "1"),
+                }
             }
 
             if let Some(b_cmd) = b_cmd {
@@ -543,12 +552,14 @@ fn eval_command(
         },
         ast::Command::And(a_cmd, b_cmd) => {
             let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
-            let exit_code = if !procs.is_empty() {
-                run_job(job_manager, procs, pgid, true)
-            } else {
-                Ok(())
-            };
-            if exit_code.is_ok() {
+            if !procs.is_empty() {
+                let result = run_job(job_manager, procs, pgid, true);
+                match result {
+                    Ok(()) => std::env::set_var("?", "0"),
+                    Err(_) => std::env::set_var("?", "1"),
+                }
+            }
+            if std::env::var("?").unwrap_or_default() == "0" {
                 eval_command(job_manager, b_cmd, None, None)
             } else {
                 Ok((vec![], None))
@@ -556,12 +567,14 @@ fn eval_command(
         },
         ast::Command::Or(a_cmd, b_cmd) => {
             let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
-            let exit_code = if !procs.is_empty() {
-                run_job(job_manager, procs, pgid, true)
-            } else {
-                Err(PosixError::Eval(anyhow::anyhow!("empty command")))
-            };
-            if exit_code.is_err() {
+            if !procs.is_empty() {
+                let result = run_job(job_manager, procs, pgid, true);
+                match result {
+                    Ok(()) => std::env::set_var("?", "0"),
+                    Err(_) => std::env::set_var("?", "1"),
+                }
+            }
+            if std::env::var("?").unwrap_or_default() != "0" {
                 eval_command(job_manager, b_cmd, None, None)
             } else {
                 Ok((vec![], None))
@@ -589,12 +602,14 @@ fn eval_command(
         } => {
             for cond in conds {
                 let (procs, pgid) = eval_command(job_manager, &cond.cond, None, None)?;
-                let result = if !procs.is_empty() {
-                    run_job(job_manager, procs, pgid, true)
-                } else {
-                    Ok(())
-                };
-                if result.is_ok() {
+                if !procs.is_empty() {
+                    let result = run_job(job_manager, procs, pgid, true);
+                    match result {
+                        Ok(()) => std::env::set_var("?", "0"),
+                        Err(_) => std::env::set_var("?", "1"),
+                    }
+                }
+                if std::env::var("?").unwrap_or_default() == "0" {
                     return eval_command(job_manager, &cond.body, None, None);
                 }
             }
@@ -607,12 +622,14 @@ fn eval_command(
         ast::Command::While { cond, body } => {
             loop {
                 let (procs, pgid) = eval_command(job_manager, cond, None, None)?;
-                let result = if !procs.is_empty() {
-                    run_job(job_manager, procs, pgid, true)
-                } else {
-                    Ok(())
-                };
-                if result.is_err() {
+                if !procs.is_empty() {
+                    let result = run_job(job_manager, procs, pgid, true);
+                    match result {
+                        Ok(()) => std::env::set_var("?", "0"),
+                        Err(_) => std::env::set_var("?", "1"),
+                    }
+                }
+                if std::env::var("?").unwrap_or_default() != "0" {
                     break;
                 }
                 let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
