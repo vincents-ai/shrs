@@ -431,19 +431,42 @@ fn eval_command(
             redirects,
             args,
         } => {
-            // Process variable assignments
+            // Process explicit variable assignments from the grammar (WORD = WORD)
             for assign in assigns {
                 let val = expand_variables(&assign.val);
                 std::env::set_var(&assign.var, &val);
             }
 
-            // If there are no args, this is just an assignment — no command to run
-            if args.is_empty() {
+            // If there are no args, check if the first arg was actually an assignment
+            // (lexer produces "x=world" as a single WORD)
+            let mut filtered_args: Vec<&String> = Vec::new();
+            for arg in args {
+                if filtered_args.is_empty() {
+                    // Before command name: check for inline assignment (x=value)
+                    if let Some(eq_pos) = arg.find('=') {
+                        if eq_pos > 0 {
+                            let name = &arg[..eq_pos];
+                            let val = &arg[eq_pos + 1..];
+                            if name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+                                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            {
+                                let expanded_val = expand_variables(val);
+                                std::env::set_var(name, &expanded_val);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                filtered_args.push(arg);
+            }
+
+            // If no actual command remains (all were assignments), just return
+            if filtered_args.is_empty() {
                 return Ok((vec![], None));
             }
 
             // Expand all arguments
-            let expanded_args: Vec<String> = args.iter().flat_map(|a| expand_arg(a)).collect();
+            let expanded_args: Vec<String> = filtered_args.iter().flat_map(|a| expand_arg(a)).collect();
             let mut args_it = expanded_args.iter();
             let program = match args_it.next() {
                 Some(p) => p.clone(),
