@@ -16,6 +16,7 @@ thread_local! {
 }
 
 pub fn eval(job_manager: &mut JobManager, parser: Parser, lexer: Lexer) -> Result<(), PosixError> {
+    let source = lexer.input();
     let parsed = match parser.parse(lexer) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -24,9 +25,18 @@ pub fn eval(job_manager: &mut JobManager, parser: Parser, lexer: Lexer) -> Resul
         },
     };
 
+    // Pre-scan for function definitions and store their body source text
+    extract_functions(&parsed, source);
+
     let (procs, pgid) = match eval_command(job_manager, &parsed, None, None) {
         Ok((procs, pgid)) => (procs, pgid),
         Err(PosixError::CommandNotFound(cmd)) => {
+            // Check if it's a stored function
+            let func_body = FUNCTIONS.with(|f| f.borrow().get(&cmd).cloned());
+            if let Some(body) = func_body {
+                let _ = eval_string(job_manager, &body);
+                return Ok(());
+            }
             if !cmd.is_empty() {
                 eprintln!("__notfound__: {cmd}");
             }
@@ -40,6 +50,59 @@ pub fn eval(job_manager: &mut JobManager, parser: Parser, lexer: Lexer) -> Resul
         run_job(job_manager, procs, pgid, true)?;
     }
     Ok(())
+}
+
+/// Walk the AST to find Fn nodes and extract their body source text.
+fn extract_functions(cmd: &ast::Command, source: &str) {
+    match cmd {
+        ast::Command::Fn { fname, body: _ } => {
+            // Find the function body in the source text.
+            // Pattern: fname() { body }
+            // Look for the opening { after fname()
+            let pattern = format!("{}()", fname);
+            if let Some(start) = source.find(&pattern) {
+                let after_name = &source[start + pattern.len()..];
+                // Skip whitespace to find {
+                if let Some(brace_start) = after_name.find('{') {
+                    let body_start = start + pattern.len() + brace_start;
+                    // Find matching closing brace
+                    let mut depth = 0;
+                    let mut body_end = body_start;
+                    for (i, ch) in source[body_start..].chars().enumerate() {
+                        if ch == '{' {
+                            depth += 1;
+                        } else if ch == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                body_end = body_start + i;
+                                break;
+                            }
+                        }
+                    }
+                    // Body is between the braces (exclusive)
+                    let body_text = source[body_start + 1..body_end].trim();
+                    FUNCTIONS.with(|f| {
+                        f.borrow_mut().insert(fname.clone(), body_text.to_string());
+                    });
+                }
+            }
+        },
+        ast::Command::SeqList(a, b) => {
+            extract_functions(a, source);
+            if let Some(b) = b {
+                extract_functions(b, source);
+            }
+        },
+        ast::Command::And(a, b) => {
+            extract_functions(a, source);
+            extract_functions(b, source);
+        },
+        ast::Command::Or(a, b) => {
+            extract_functions(a, source);
+            extract_functions(b, source);
+        },
+        _ => {},
+    }
 }
 
 /// Evaluate a raw command string (used for function invocation and command substitution).
@@ -743,17 +806,9 @@ fn eval_command(
             }
             Ok((vec![], None))
         },
-        ast::Command::Fn { fname, body } => {
-            // Function body is not stored here — instead, the grammar's
-            // FunctionDefinition rule already extracts the body. We store
-            // the raw body source in FUNCTIONS for later invocation.
-            // Since we can't easily get the source text here, we store a
-            // debug representation.
-            // TODO: proper function storage with AST preservation
-            drop(body);
-            FUNCTIONS.with(|f| {
-                f.borrow_mut().insert(fname.clone(), fname.clone());
-            });
+        ast::Command::Fn { fname, body: _ } => {
+            // Function body extracted by extract_functions() during pre-scan.
+            // Nothing to do at eval time — body is stored in FUNCTIONS thread-local.
             Ok((vec![], None))
         },
         ast::Command::None => Ok((vec![], None)),
