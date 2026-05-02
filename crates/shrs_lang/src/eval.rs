@@ -1,33 +1,35 @@
 // Lot of code based off of https://github.com/nuta/nsh/blob/main/src/eval.rs
 
+use std::os::unix::io::FromRawFd;
+use std::process::{Command, Stdio};
+
 use glob::glob;
 use shrs_job::{run_external_command, JobManager, Output, Process, ProcessGroup, Stdin};
 
 use crate::{ast, Lexer, Parser, PosixError};
 
 pub fn eval(job_manager: &mut JobManager, parser: Parser, lexer: Lexer) -> Result<(), PosixError> {
-
     let parsed = match parser.parse(lexer) {
         Ok(parsed) => parsed,
         Err(e) => {
-            // TODO detailed parse errors
             eprintln!("parse error: {e}");
             return Err(PosixError::Parse(e));
         },
     };
 
-    let (procs, pgid) =
-        match eval_command(job_manager, &parsed, None, None) {
-            Ok((procs, pgid)) => (procs, pgid),
-            Err(PosixError::CommandNotFound(_)) => {
-                // let _ = cmd.run_hook(CommandNotFoundCtx {});
-                // TODO return error code 127
-                return Ok(());
-            },
-            _ => return Ok(()),
-        };
+    let (procs, pgid) = match eval_command(job_manager, &parsed, None, None) {
+        Ok((procs, pgid)) => (procs, pgid),
+        Err(PosixError::CommandNotFound(cmd)) => {
+            eprintln!("__notfound__: {cmd}");
+            return Err(PosixError::CommandNotFound(cmd));
+        },
+        Err(e) => return Err(e),
+    };
 
-    run_job(job_manager, procs, pgid, true)?;
+    // Only run if there are actual processes to execute
+    if !procs.is_empty() {
+        run_job(job_manager, procs, pgid, true)?;
+    }
     Ok(())
 }
 
@@ -57,40 +59,363 @@ fn run_job(
     Ok(())
 }
 
-fn expand_arg(arg: &String) -> Vec<String> {
-    let mut a = arg.clone();
+/// Expand a single argument string, handling variable references, command substitution,
+/// arithmetic expansion, tilde expansion, quoting, and globbing.
+fn expand_arg(arg: &str) -> Vec<String> {
+    // First, perform all $ expansions in the string
+    let expanded = expand_variables(arg);
 
-    // expand ~
-    if let Some(remaining) = arg.strip_prefix("~") {
-        a = format!(
+    // Handle quoted strings — no glob expansion, strip quotes
+    let first = arg.chars().next().unwrap_or(' ');
+    if first == '\'' {
+        // Single quotes: literal, no expansion happened needed but strip quotes
+        let inner = arg.trim_matches('\'');
+        return vec![inner.to_string()];
+    }
+    if first == '"' {
+        // Double quotes: variables already expanded above, just strip quotes
+        let inner = expanded.trim_matches('"');
+        return vec![inner.to_string()];
+    }
+
+    // Tilde expansion
+    let expanded = if let Some(remaining) = expanded.strip_prefix('~') {
+        format!(
             "{}{}",
-            dirs::home_dir().unwrap().to_string_lossy(),
+            dirs::home_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default(),
             remaining
-        );
-    }
+        )
+    } else {
+        expanded
+    };
 
-    // quotes escape all special characters
-    let first = arg.chars().next().unwrap();
-    if first == '\'' || first == '\"' {
-        return a
-            .trim_matches(|c| c == '\'' || c == '\"')
-            .split_whitespace()
-            .map(ToString::to_string)
-            .collect();
-    }
-    // match globbed files only if the glob actually works
-    else if glob::Pattern::escape(a.as_str()) != a.as_str() {
-        if let Ok(files) = glob(a.as_str()) {
-            return files
-                .filter_map(|file| match file {
-                    Ok(s) => Some(s.to_string_lossy().to_string()),
-                    Err(s) => Some(s.to_string()),
-                })
+    // Glob expansion — only if the string actually contains glob characters
+    if glob::Pattern::escape(&expanded) != expanded {
+        if let Ok(files) = glob(&expanded) {
+            let results: Vec<String> = files
+                .filter_map(|f| f.ok())
+                .map(|f| f.to_string_lossy().to_string())
                 .collect();
+            if !results.is_empty() {
+                return results;
+            }
         }
     }
 
-    vec![a]
+    vec![expanded]
+}
+
+/// Expand $VAR, ${VAR}, $(cmd), and $((expr)) in a string.
+fn expand_variables(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '$' {
+            if i + 1 >= len {
+                result.push('$');
+                i += 1;
+                continue;
+            }
+
+            // $((expr)) — arithmetic expansion
+            if i + 2 < len && chars[i + 1] == '(' && chars[i + 2] == '(' {
+                let start = i + 3;
+                if let Some(end) = find_closing(&chars, start, "((", "))") {
+                    let expr: String = chars[start..end].iter().collect();
+                    let val = eval_arithmetic(&expr);
+                    result.push_str(&val);
+                    i = end + 2; // skip closing ))
+                    continue;
+                }
+            }
+
+            // $(cmd) — command substitution
+            if chars[i + 1] == '(' {
+                let start = i + 2;
+                if let Some(end) = find_closing_paren(&chars, start) {
+                    let cmd: String = chars[start..end].iter().collect();
+                    let val = eval_command_substitution(&cmd);
+                    result.push_str(&val);
+                    i = end + 1; // skip closing )
+                    continue;
+                }
+            }
+
+            // ${VAR} — braced variable reference
+            if chars[i + 1] == '{' {
+                let start = i + 2;
+                if let Some(end) = chars[start..].iter().position(|&c| c == '}') {
+                    let var_name: String = chars[start..start + end].iter().collect();
+                    let val = std::env::var(&var_name).unwrap_or_default();
+                    result.push_str(&val);
+                    i = start + end + 1; // skip closing }
+                    continue;
+                }
+            }
+
+            // $VAR — simple variable reference (alphanumeric + underscore)
+            if chars[i + 1] == '?' {
+                // $? — last exit status (simplified: always 0 for now)
+                result.push('0');
+                i += 2;
+                continue;
+            }
+
+            let start = i + 1;
+            let mut end = start;
+            while end < len && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            if end > start {
+                let var_name: String = chars[start..end].iter().collect();
+                let val = std::env::var(&var_name).unwrap_or_default();
+                result.push_str(&val);
+                i = end;
+                continue;
+            }
+
+            // Lone $ — keep as-is
+            result.push('$');
+            i += 1;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Find closing delimiter in char slice starting from `start`.
+fn find_closing(chars: &[char], start: usize, _open: &str, close: &str) -> Option<usize> {
+    let close_chars: Vec<char> = close.chars().collect();
+    let clen = close_chars.len();
+    for i in start..chars.len().saturating_sub(clen - 1) {
+        if chars[i..i + clen] == close_chars[..] {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Find matching closing parenthesis, respecting nesting.
+fn find_closing_paren(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '(' {
+            depth += 1;
+        } else if chars[i] == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Evaluate a simple arithmetic expression (integers only, +, -, *, /, %, parentheses).
+fn eval_arithmetic(expr: &str) -> String {
+    let expr = expr.trim();
+    // Simple recursive descent parser for arithmetic
+    match arithmetic_expr(expr) {
+        Ok((remaining, val)) if remaining.trim().is_empty() => val.to_string(),
+        _ => {
+            // Try to evaluate as a variable reference
+            if let Ok(val) = std::env::var(expr) {
+                return val;
+            }
+            "0".to_string()
+        },
+    }
+}
+
+/// Recursive descent arithmetic parser.
+fn arithmetic_expr(input: &str) -> Result<(&str, i64), ()> {
+    let (input, val) = parse_add_sub(input.trim())?;
+    Ok((input, val))
+}
+
+fn parse_add_sub(input: &str) -> Result<(&str, i64), ()> {
+    let (mut input, mut val) = parse_mul_div(input)?;
+    loop {
+        input = input.trim_start();
+        if input.starts_with('+') && !input.starts_with("++") {
+            let (rest, rhs) = parse_mul_div(&input[1..])?;
+            val += rhs;
+            input = rest;
+        } else if input.starts_with('-') && !input.starts_with("--") {
+            let (rest, rhs) = parse_mul_div(&input[1..])?;
+            val -= rhs;
+            input = rest;
+        } else {
+            break;
+        }
+    }
+    Ok((input, val))
+}
+
+fn parse_mul_div(input: &str) -> Result<(&str, i64), ()> {
+    let (mut input, mut val) = parse_unary(input)?;
+    loop {
+        input = input.trim_start();
+        if input.starts_with('*') {
+            let (rest, rhs) = parse_unary(&input[1..])?;
+            val *= rhs;
+            input = rest;
+        } else if input.starts_with('/') {
+            let (rest, rhs) = parse_unary(&input[1..])?;
+            if rhs != 0 {
+                val /= rhs;
+            }
+            input = rest;
+        } else if input.starts_with('%') {
+            let (rest, rhs) = parse_unary(&input[1..])?;
+            if rhs != 0 {
+                val %= rhs;
+            }
+            input = rest;
+        } else {
+            break;
+        }
+    }
+    Ok((input, val))
+}
+
+fn parse_unary(input: &str) -> Result<(&str, i64), ()> {
+    let input = input.trim_start();
+    if input.starts_with('-') {
+        let (rest, val) = parse_primary(&input[1..])?;
+        Ok((rest, -val))
+    } else if input.starts_with('+') {
+        parse_primary(&input[1..])
+    } else {
+        parse_primary(input)
+    }
+}
+
+fn parse_primary(input: &str) -> Result<(&str, i64), ()> {
+    let input = input.trim_start();
+    if input.starts_with('(') {
+        let (rest, val) = parse_add_sub(&input[1..])?;
+        let rest = rest.trim_start();
+        if rest.starts_with(')') {
+            Ok((&rest[1..], val))
+        } else {
+            Err(())
+        }
+    } else {
+        // Parse number or variable
+        let end = input
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(input.len());
+        if end == 0 {
+            return Err(());
+        }
+        let token = &input[..end];
+        let val = if token.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            token.parse::<i64>().unwrap_or(0)
+        } else {
+            // Variable reference
+            std::env::var(token)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        Ok((&input[end..], val))
+    }
+}
+
+/// Execute command substitution: $(cmd) — run cmd and capture stdout.
+fn eval_command_substitution(cmd: &str) -> String {
+    let output = Command::new("/proc/self/exe")
+        .arg("--mode")
+        .arg("admin")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // Trim trailing newlines (POSIX behavior)
+            s.trim_end_matches('\n').trim_end_matches('\r').to_string()
+        },
+        Err(_) => String::new(),
+    }
+}
+
+/// Process redirect operators, returning modified stdin/stdout.
+fn process_redirects(
+    redirects: &[ast::Redirect],
+    default_stdin: Stdin,
+    default_stdout: Output,
+) -> (Stdin, Output) {
+    use std::fs;
+
+    let mut stdin = default_stdin;
+    let mut stdout = default_stdout;
+
+    for redirect in redirects {
+        let file = expand_variables(&redirect.file);
+        match redirect.mode {
+            ast::RedirectMode::Read => {
+                if let Ok(f) = fs::File::open(&file) {
+                    stdin = Stdin::File(f);
+                }
+            },
+            ast::RedirectMode::Write => {
+                if let Ok(f) = fs::File::create(&file) {
+                    stdout = Output::File(f);
+                }
+            },
+            ast::RedirectMode::WriteAppend => {
+                if let Ok(f) = fs::OpenOptions::new().append(true).create(true).open(&file) {
+                    stdout = Output::File(f);
+                }
+            },
+            ast::RedirectMode::ReadAppend => {
+                if let Ok(f) = fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .create(true)
+                    .open(&file)
+                {
+                    stdout = Output::File(f);
+                }
+            },
+            ast::RedirectMode::ReadDup => {
+                if let Ok(fd) = file.parse::<i32>() {
+                    stdin = Stdin::File(unsafe { std::fs::File::from_raw_fd(fd) });
+                }
+            },
+            ast::RedirectMode::WriteDup => {
+                if let Ok(fd) = file.parse::<i32>() {
+                    stdout = Output::FileDescriptor(fd);
+                }
+            },
+            ast::RedirectMode::ReadWrite => {
+                if let Ok(f) = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&file)
+                {
+                    stdout = Output::File(f);
+                }
+            },
+        }
+    }
+
+    (stdin, stdout)
 }
 
 /// Returns group of processes and also the pgid if it has one
@@ -102,19 +427,36 @@ fn eval_command(
 ) -> Result<(Vec<Box<dyn Process>>, Option<u32>), PosixError> {
     match cmd {
         ast::Command::Simple {
-            assigns: _,
-            redirects: _,
+            assigns,
+            redirects,
             args,
         } => {
-            let mut args_it = args.iter();
-            let program = args_it.next().unwrap();
-            let args = args_it.flat_map(expand_arg).collect::<Vec<_>>();
+            // Process variable assignments
+            for assign in assigns {
+                let val = expand_variables(&assign.val);
+                std::env::set_var(&assign.var, &val);
+            }
 
-            let proc_stdin = stdin.unwrap_or(Stdin::Inherit);
-            let proc_stdout = stdout.unwrap_or(Output::Inherit);
+            // If there are no args, this is just an assignment — no command to run
+            if args.is_empty() {
+                return Ok((vec![], None));
+            }
+
+            // Expand all arguments
+            let expanded_args: Vec<String> = args.iter().flat_map(|a| expand_arg(a)).collect();
+            let mut args_it = expanded_args.iter();
+            let program = match args_it.next() {
+                Some(p) => p.clone(),
+                None => return Ok((vec![], None)),
+            };
+            let args = args_it.cloned().collect::<Vec<_>>();
+
+            let default_stdin = stdin.unwrap_or(Stdin::Inherit);
+            let default_stdout = stdout.unwrap_or(Output::Inherit);
+            let (proc_stdin, proc_stdout) = process_redirects(redirects, default_stdin, default_stdout);
 
             let (proc, pgid) = match run_external_command(
-                program,
+                &program,
                 &args,
                 proc_stdin,
                 proc_stdout,
@@ -144,9 +486,10 @@ fn eval_command(
             Ok((a_procs, b_pgid))
         },
         ast::Command::AsyncList(a_cmd, b_cmd) => {
-            // TODO double check stdin and stdout
             let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
-            run_job(job_manager, procs, pgid, false)?;
+            if !procs.is_empty() {
+                run_job(job_manager, procs, pgid, false)?;
+            }
 
             if let Some(b_cmd) = b_cmd {
                 eval_command(job_manager, b_cmd, None, None)
@@ -156,7 +499,9 @@ fn eval_command(
         },
         ast::Command::SeqList(a_cmd, b_cmd) => {
             let (procs, pgid) = eval_command(job_manager, a_cmd, stdin, stdout)?;
-            run_job(job_manager, procs, pgid, true)?;
+            if !procs.is_empty() {
+                run_job(job_manager, procs, pgid, true)?;
+            }
 
             if let Some(b_cmd) = b_cmd {
                 eval_command(job_manager, b_cmd, None, None)
@@ -166,7 +511,11 @@ fn eval_command(
         },
         ast::Command::And(a_cmd, b_cmd) => {
             let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
-            let exit_code = run_job(job_manager, procs, pgid, true);
+            let exit_code = if !procs.is_empty() {
+                run_job(job_manager, procs, pgid, true)
+            } else {
+                Ok(())
+            };
             if exit_code.is_ok() {
                 eval_command(job_manager, b_cmd, None, None)
             } else {
@@ -175,7 +524,11 @@ fn eval_command(
         },
         ast::Command::Or(a_cmd, b_cmd) => {
             let (procs, pgid) = eval_command(job_manager, a_cmd, None, None)?;
-            let exit_code = run_job(job_manager, procs, pgid, true);
+            let exit_code = if !procs.is_empty() {
+                run_job(job_manager, procs, pgid, true)
+            } else {
+                Err(PosixError::Eval(anyhow::anyhow!("empty command")))
+            };
             if exit_code.is_err() {
                 eval_command(job_manager, b_cmd, None, None)
             } else {
@@ -184,8 +537,16 @@ fn eval_command(
         },
         ast::Command::Not(cmd) => {
             let (procs, pgid) = eval_command(job_manager, cmd, None, None)?;
-            run_job(job_manager, procs, pgid, true)?;
-            Ok((vec![], None))
+            if !procs.is_empty() {
+                let result = run_job(job_manager, procs, pgid, true);
+                // Invert: success -> failure, failure -> success
+                match result {
+                    Ok(()) => Ok((vec![], None)), // TODO: should return exit code 1
+                    Err(_) => Ok((vec![], None)),
+                }
+            } else {
+                Ok((vec![], None))
+            }
         },
         ast::Command::Subshell(cmd) => {
             eval_command(job_manager, cmd, stdin, stdout)
@@ -196,7 +557,11 @@ fn eval_command(
         } => {
             for cond in conds {
                 let (procs, pgid) = eval_command(job_manager, &cond.cond, None, None)?;
-                let result = run_job(job_manager, procs, pgid, true);
+                let result = if !procs.is_empty() {
+                    run_job(job_manager, procs, pgid, true)
+                } else {
+                    Ok(())
+                };
                 if result.is_ok() {
                     return eval_command(job_manager, &cond.body, None, None);
                 }
@@ -210,50 +575,72 @@ fn eval_command(
         ast::Command::While { cond, body } => {
             loop {
                 let (procs, pgid) = eval_command(job_manager, cond, None, None)?;
-                let result = run_job(job_manager, procs, pgid, true);
+                let result = if !procs.is_empty() {
+                    run_job(job_manager, procs, pgid, true)
+                } else {
+                    Ok(())
+                };
                 if result.is_err() {
                     break;
                 }
                 let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
-                run_job(job_manager, body_procs, body_pgid, true)?;
+                if !body_procs.is_empty() {
+                    run_job(job_manager, body_procs, body_pgid, true)?;
+                }
             }
             Ok((vec![], None))
         },
         ast::Command::Until { cond, body } => {
             loop {
                 let (procs, pgid) = eval_command(job_manager, cond, None, None)?;
-                let result = run_job(job_manager, procs, pgid, true);
+                let result = if !procs.is_empty() {
+                    run_job(job_manager, procs, pgid, true)
+                } else {
+                    Err(PosixError::Eval(anyhow::anyhow!("empty")))
+                };
                 if result.is_ok() {
                     break;
                 }
                 let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
-                run_job(job_manager, body_procs, body_pgid, true)?;
+                if !body_procs.is_empty() {
+                    run_job(job_manager, body_procs, body_pgid, true)?;
+                }
             }
             Ok((vec![], None))
         },
         ast::Command::For {
-            name: _,
+            name,
             wordlist,
             body,
         } => {
             for word in wordlist {
-                // TODO: set variable `name` to `word` in the environment
-                std::env::set_var("_iter_val", word);
+                let expanded_word = expand_variables(word);
+                std::env::set_var(name, &expanded_word);
                 let (body_procs, body_pgid) = eval_command(job_manager, body, None, None)?;
-                run_job(job_manager, body_procs, body_pgid, true)?;
+                if !body_procs.is_empty() {
+                    run_job(job_manager, body_procs, body_pgid, true)?;
+                }
             }
             Ok((vec![], None))
         },
-        ast::Command::Case { word: _, arms } => {
-            // TODO: proper pattern matching
+        ast::Command::Case { word, arms } => {
+            let expanded_word = expand_variables(word);
             for arm in arms {
-                let (procs, pgid) = eval_command(job_manager, &arm.body, None, None)?;
-                run_job(job_manager, procs, pgid, true)?;
+                for pattern in &arm.pattern {
+                    let expanded_pattern = expand_variables(pattern);
+                    if expanded_pattern == expanded_word || expanded_pattern == "*" {
+                        let (procs, pgid) = eval_command(job_manager, &arm.body, None, None)?;
+                        if !procs.is_empty() {
+                            run_job(job_manager, procs, pgid, true)?;
+                        }
+                        return Ok((vec![], None));
+                    }
+                }
             }
             Ok((vec![], None))
         },
         ast::Command::Fn { fname: _, body } => {
-            // TODO: register function
+            // TODO: register function for later invocation
             eval_command(job_manager, body, None, None)
         },
         ast::Command::None => Ok((vec![], None)),

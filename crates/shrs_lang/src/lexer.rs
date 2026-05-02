@@ -178,24 +178,6 @@ impl<'input> Lexer<'input> {
         }
         (&self.input[start..end], end)
     }
-    fn take_until_inclusive<F>(
-        &mut self,
-        start: usize,
-        mut end: usize,
-        mut terminate: F,
-    ) -> (&'input str, usize)
-    where
-        F: FnMut(char) -> bool,
-    {
-        while let Some((_, ch, _)) = self.lookahead {
-            if terminate(ch) {
-                return (&self.input[start..=end], end + 1);
-            } else if let Some((_, _, e)) = self.advance() {
-                end = e;
-            }
-        }
-        (&self.input[start..end], end)
-    }
 }
 
 impl<'input> Iterator for Lexer<'input> {
