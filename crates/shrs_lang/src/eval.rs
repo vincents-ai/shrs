@@ -59,29 +59,6 @@ fn eval_string(job_manager: &mut JobManager, input: &str) -> Result<(), PosixErr
     }
     Ok(())
 }
-    let parsed = match parser.parse(lexer) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            eprintln!("parse error: {e}");
-            return Err(PosixError::Parse(e));
-        },
-    };
-
-    let (procs, pgid) = match eval_command(job_manager, &parsed, None, None) {
-        Ok((procs, pgid)) => (procs, pgid),
-        Err(PosixError::CommandNotFound(cmd)) => {
-            eprintln!("__notfound__: {cmd}");
-            return Err(PosixError::CommandNotFound(cmd));
-        },
-        Err(e) => return Err(e),
-    };
-
-    // Only run if there are actual processes to execute
-    if !procs.is_empty() {
-        run_job(job_manager, procs, pgid, true)?;
-    }
-    Ok(())
-}
 
 fn run_job(
     job_manager: &mut JobManager,
